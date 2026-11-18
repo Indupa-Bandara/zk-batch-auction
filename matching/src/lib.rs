@@ -1081,6 +1081,48 @@ mod tests {
     }
 
     #[test]
+    fn account_state_transition_handles_multiple_orders_per_account_in_any_order() {
+        let orders = [
+            signed_order(11, Side::Buy, 10, 1, 5, 9, 101),
+            signed_order(11, Side::Buy, 10, 1, 6, 9, 101),
+            signed_order(22, Side::Sell, 10, 1, 3, 9, 101),
+            signed_order(22, Side::Sell, 10, 1, 4, 9, 101),
+        ];
+        let result = clear_auction(&orders, None).unwrap();
+        let mut accounts = vec![
+            AccountState {
+                account_id: orders[0].account_id,
+                next_nonce: 5,
+                base_balance: 0,
+                quote_balance: 20,
+            },
+            AccountState {
+                account_id: orders[2].account_id,
+                next_nonce: 3,
+                base_balance: 2,
+                quote_balance: 0,
+            },
+        ];
+        accounts.sort_unstable_by_key(|account| account.account_id);
+        let transition = apply_account_state_transition(&accounts, &orders, &result).unwrap();
+
+        let reordered_orders = [
+            orders[3].clone(),
+            orders[1].clone(),
+            orders[2].clone(),
+            orders[0].clone(),
+        ];
+        let reordered_result = clear_auction(&reordered_orders, None).unwrap();
+        let reordered_transition =
+            apply_account_state_transition(&accounts, &reordered_orders, &reordered_result)
+                .unwrap();
+
+        assert_eq!(transition, reordered_transition);
+        assert_eq!(result.volume, 2);
+        assert_eq!(result.fills, [1, 1, 1, 1]);
+    }
+
+    #[test]
     fn account_state_transition_rejects_insufficient_net_balance() {
         let orders = [
             signed_order(11, Side::Buy, 10, 2, 5, 9, 101),
