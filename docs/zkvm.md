@@ -11,8 +11,15 @@ account nonce sequences and net balances against the complete account-state
 witness and commits the before/after account roots. It commits the batch ID and
 timestamp, SHA-256 batch commitment, previous and new clearing prices, volume,
 and fills commitment.
-Orders and `(order hash, fill)` pairs are encoded in hash-sorted order, so the
-commitments do not depend on the input vector order.
+The batch commitment hashes the `batch-auction-exchange/order-batch/v1`
+domain and zero byte, the order count as a big-endian `u64`, then each order
+in hash-sorted order. An order encodes its account key, side byte, limit price,
+quantity, nonce, batch ID, expiry, order hash, signature length as a big-endian
+`u64`, and signature bytes. The fills commitment hashes the
+`batch-auction-exchange/fills/v1` domain and zero byte, the fill count as a
+big-endian `u64`, then `(order hash, fill)` pairs in the same canonical order;
+each fill is a big-endian `u64`. These encodings are independent of input vector
+order and usable by the `no_std` guest.
 
 The timestamp is supplied by the prover; an integrating settlement layer must
 check it against a trusted clock and apply the new account root only if the

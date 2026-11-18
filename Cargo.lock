@@ -345,7 +345,6 @@ dependencies = [
 name = "batch-auction-matching"
 version = "0.1.0"
 dependencies = [
- "bincode",
  "ed25519-dalek",
  "proptest",
  "serde",

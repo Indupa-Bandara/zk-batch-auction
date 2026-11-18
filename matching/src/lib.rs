@@ -1,3 +1,9 @@
+#![cfg_attr(target_os = "zkvm", no_std)]
+
+extern crate alloc;
+
+use alloc::{vec, vec::Vec};
+use core::{cmp::Ordering, fmt};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -74,7 +80,6 @@ pub enum MatchError {
     ArithmeticOverflow,
     InvalidAllocation,
     InvalidWitness,
-    SerializationError,
     InvalidAccountId,
     InvalidSignature,
     InvalidOrderHash,
@@ -86,14 +91,13 @@ pub enum MatchError {
     InsufficientBalance,
 }
 
-impl std::fmt::Display for MatchError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for MatchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::DuplicateOrderHash => "duplicate order hash",
             Self::ArithmeticOverflow => "auction arithmetic overflow",
             Self::InvalidAllocation => "invalid auction allocation",
             Self::InvalidWitness => "invalid auction witness",
-            Self::SerializationError => "failed to serialize auction commitment",
             Self::InvalidAccountId => "invalid Ed25519 account public key",
             Self::InvalidSignature => "invalid order signature",
             Self::InvalidOrderHash => "order hash does not match signed fields",
@@ -108,7 +112,7 @@ impl std::fmt::Display for MatchError {
     }
 }
 
-impl std::error::Error for MatchError {}
+impl core::error::Error for MatchError {}
 
 const ORDER_DOMAIN: &[u8] = b"batch-auction-exchange/order/v1\0";
 
@@ -431,8 +435,29 @@ pub fn canonical_order_batch_bytes(
     hash_sorted_order_indices: &[u32],
 ) -> Result<Vec<u8>, MatchError> {
     let indices = validate_hash_sorted_indices(orders, hash_sorted_order_indices)?;
-    let canonical_orders: Vec<&Order> = indices.iter().map(|index| &orders[*index]).collect();
-    bincode::serialize(&canonical_orders).map_err(|_| MatchError::SerializationError)
+    let order_count = u64::try_from(indices.len()).map_err(|_| MatchError::ArithmeticOverflow)?;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"batch-auction-exchange/order-batch/v1\0");
+    bytes.extend_from_slice(&order_count.to_be_bytes());
+    for index in indices {
+        let order = &orders[index];
+        bytes.extend_from_slice(&order.account_id);
+        bytes.push(match order.side {
+            Side::Buy => 0,
+            Side::Sell => 1,
+        });
+        bytes.extend_from_slice(&order.limit_price.to_be_bytes());
+        bytes.extend_from_slice(&order.quantity.to_be_bytes());
+        bytes.extend_from_slice(&order.nonce.to_be_bytes());
+        bytes.extend_from_slice(&order.batch_id.to_be_bytes());
+        bytes.extend_from_slice(&order.expiry.to_be_bytes());
+        bytes.extend_from_slice(&order.order_hash);
+        let signature_length =
+            u64::try_from(order.signature.len()).map_err(|_| MatchError::ArithmeticOverflow)?;
+        bytes.extend_from_slice(&signature_length.to_be_bytes());
+        bytes.extend_from_slice(&order.signature);
+    }
+    Ok(bytes)
 }
 
 pub fn canonical_fills_bytes(
@@ -444,11 +469,15 @@ pub fn canonical_fills_bytes(
         return Err(MatchError::InvalidWitness);
     }
     let indices = validate_hash_sorted_indices(orders, hash_sorted_order_indices)?;
-    let canonical_fills: Vec<([u8; 32], u64)> = indices
-        .iter()
-        .map(|index| (orders[*index].order_hash, fills[*index]))
-        .collect();
-    bincode::serialize(&canonical_fills).map_err(|_| MatchError::SerializationError)
+    let fill_count = u64::try_from(indices.len()).map_err(|_| MatchError::ArithmeticOverflow)?;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"batch-auction-exchange/fills/v1\0");
+    bytes.extend_from_slice(&fill_count.to_be_bytes());
+    for index in indices {
+        bytes.extend_from_slice(&orders[index].order_hash);
+        bytes.extend_from_slice(&fills[index].to_be_bytes());
+    }
+    Ok(bytes)
 }
 
 fn validate_permutation(orders: &[Order], indices: &[u32]) -> Result<Vec<usize>, MatchError> {
@@ -545,7 +574,7 @@ pub fn clear_auction(
     })
 }
 
-fn compare_orders(orders: &[Order], left: usize, right: usize) -> std::cmp::Ordering {
+fn compare_orders(orders: &[Order], left: usize, right: usize) -> Ordering {
     let left_order = &orders[left];
     let right_order = &orders[right];
     left_order
@@ -555,7 +584,7 @@ fn compare_orders(orders: &[Order], left: usize, right: usize) -> std::cmp::Orde
         .then_with(|| left_order.order_hash.cmp(&right_order.order_hash))
 }
 
-fn compare_order_hashes(orders: &[Order], left: usize, right: usize) -> std::cmp::Ordering {
+fn compare_order_hashes(orders: &[Order], left: usize, right: usize) -> Ordering {
     let left_order = &orders[left];
     let right_order = &orders[right];
     left_order
