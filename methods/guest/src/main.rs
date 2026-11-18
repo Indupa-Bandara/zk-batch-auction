@@ -56,5 +56,7 @@ fn main() {
 }
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
-    *Impl::hash_bytes(bytes).as_bytes()
+    let mut digest = [0; 32];
+    digest.copy_from_slice(Impl::hash_bytes(bytes).as_bytes());
+    digest
 }
