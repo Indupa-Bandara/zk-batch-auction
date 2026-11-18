@@ -1,4 +1,5 @@
 #![no_main]
+#![no_std]
 
 use batch_auction_matching::{
     apply_account_state_transition, canonical_fills_bytes, canonical_order_batch_bytes,
