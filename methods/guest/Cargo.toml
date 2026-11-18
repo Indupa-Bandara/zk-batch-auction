@@ -7,5 +7,4 @@ edition = "2021"
 
 [dependencies]
 batch-auction-matching = { path = "../../matching" }
-bincode = "1"
 risc0-zkvm = { version = "=3.1.0", default-features = false }

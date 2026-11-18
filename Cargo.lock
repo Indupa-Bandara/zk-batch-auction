@@ -336,7 +336,6 @@ version = "0.1.0"
 dependencies = [
  "batch-auction-matching",
  "batch-auction-methods",
- "bincode",
  "risc0-zkvm",
 ]
 
@@ -344,6 +343,7 @@ dependencies = [
 name = "batch-auction-matching"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "proptest",
  "serde",
 ]

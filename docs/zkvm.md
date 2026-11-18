@@ -7,6 +7,8 @@ claimed result; the guest checks both permutations, the sorted order, optimal
 price, tie-breaks, and price-priority allocation without calling the native
 matcher. It commits the batch ID, SHA-256 batch commitment, previous and new
 clearing prices, volume, and fills commitment.
+Orders and `(order hash, fill)` pairs are encoded in hash-sorted order, so the
+commitments do not depend on the input vector order.
 
 The guest scans price levels to verify the clearing price and uses pairwise
 remainder ranking at the marginal allocation level, avoiding guest-side sorts.

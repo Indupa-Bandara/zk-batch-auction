@@ -48,6 +48,7 @@ pub enum MatchError {
     ArithmeticOverflow,
     InvalidAllocation,
     InvalidWitness,
+    SerializationError,
 }
 
 impl std::fmt::Display for MatchError {
@@ -57,6 +58,7 @@ impl std::fmt::Display for MatchError {
             Self::ArithmeticOverflow => "auction arithmetic overflow",
             Self::InvalidAllocation => "invalid auction allocation",
             Self::InvalidWitness => "invalid auction witness",
+            Self::SerializationError => "failed to serialize auction commitment",
         };
         formatter.write_str(message)
     }
@@ -132,15 +134,7 @@ pub fn verify_auction(
         return Err(MatchError::InvalidWitness);
     }
 
-    let hash_indices = validate_permutation(orders, hash_sorted_order_indices)?;
-    for pair in hash_indices.windows(2) {
-        if compare_order_hashes(orders, pair[0], pair[1]).is_gt() {
-            return Err(MatchError::InvalidWitness);
-        }
-        if orders[pair[0]].order_hash == orders[pair[1]].order_hash {
-            return Err(MatchError::DuplicateOrderHash);
-        }
-    }
+    validate_hash_sorted_indices(orders, hash_sorted_order_indices)?;
 
     let levels = build_price_levels(orders, &indices)?;
     let best =
@@ -184,6 +178,31 @@ pub fn verify_auction(
     Ok(())
 }
 
+pub fn canonical_order_batch_bytes(
+    orders: &[Order],
+    hash_sorted_order_indices: &[u32],
+) -> Result<Vec<u8>, MatchError> {
+    let indices = validate_hash_sorted_indices(orders, hash_sorted_order_indices)?;
+    let canonical_orders: Vec<&Order> = indices.iter().map(|index| &orders[*index]).collect();
+    bincode::serialize(&canonical_orders).map_err(|_| MatchError::SerializationError)
+}
+
+pub fn canonical_fills_bytes(
+    orders: &[Order],
+    fills: &[u64],
+    hash_sorted_order_indices: &[u32],
+) -> Result<Vec<u8>, MatchError> {
+    if fills.len() != orders.len() {
+        return Err(MatchError::InvalidWitness);
+    }
+    let indices = validate_hash_sorted_indices(orders, hash_sorted_order_indices)?;
+    let canonical_fills: Vec<([u8; 32], u64)> = indices
+        .iter()
+        .map(|index| (orders[*index].order_hash, fills[*index]))
+        .collect();
+    bincode::serialize(&canonical_fills).map_err(|_| MatchError::SerializationError)
+}
+
 fn validate_permutation(orders: &[Order], indices: &[u32]) -> Result<Vec<usize>, MatchError> {
     if indices.len() != orders.len() {
         return Err(MatchError::InvalidWitness);
@@ -200,6 +219,22 @@ fn validate_permutation(orders: &[Order], indices: &[u32]) -> Result<Vec<usize>,
         validated.push(index);
     }
     Ok(validated)
+}
+
+fn validate_hash_sorted_indices(
+    orders: &[Order],
+    indices: &[u32],
+) -> Result<Vec<usize>, MatchError> {
+    let indices = validate_permutation(orders, indices)?;
+    for pair in indices.windows(2) {
+        if compare_order_hashes(orders, pair[0], pair[1]).is_gt() {
+            return Err(MatchError::InvalidWitness);
+        }
+        if orders[pair[0]].order_hash == orders[pair[1]].order_hash {
+            return Err(MatchError::DuplicateOrderHash);
+        }
+    }
+    Ok(indices)
 }
 
 pub fn clear_auction(
@@ -721,6 +756,34 @@ mod tests {
         assert_eq!(forward.volume, 1);
         assert_eq!(forward.fills, [0, 1, 1]);
         assert_eq!(reversed.fills, [1, 1, 0]);
+    }
+
+    #[test]
+    fn public_commitment_encodings_ignore_input_order() {
+        let orders = [
+            order(Side::Buy, 100, 2, 1),
+            order(Side::Sell, 100, 1, 2),
+            order(Side::Buy, 99, 3, 3),
+        ];
+        let result = clear_auction(&orders, None).unwrap();
+        let reversed_orders: Vec<Order> = orders.iter().cloned().rev().collect();
+        let reversed_result = clear_auction(&reversed_orders, None).unwrap();
+        let hash_indices = hash_sorted_order_indices(&orders).unwrap();
+        let reversed_hash_indices = hash_sorted_order_indices(&reversed_orders).unwrap();
+
+        assert_eq!(
+            canonical_order_batch_bytes(&orders, &hash_indices).unwrap(),
+            canonical_order_batch_bytes(&reversed_orders, &reversed_hash_indices).unwrap()
+        );
+        assert_eq!(
+            canonical_fills_bytes(&orders, &result.fills, &hash_indices).unwrap(),
+            canonical_fills_bytes(
+                &reversed_orders,
+                &reversed_result.fills,
+                &reversed_hash_indices
+            )
+            .unwrap()
+        );
     }
 
     #[test]
