@@ -2,12 +2,15 @@
 
 The first proof pipeline uses `risc0-zkvm` 3.1.0 and `risc0-build` 3.0.7. The
 RISC Zero 3.1.0 release pins `risc0-build` to 3.0.7. The host and guest share the
-`batch-auction-matching` crate. The guest recomputes the reference matcher,
-rejects a host result that differs, and commits the batch ID, SHA-256 batch
-commitment, clearing price, volume, and fills commitment.
+`batch-auction-matching` crate. The host supplies price-sorted and hash-sorted order-index permutations and a
+claimed result; the guest checks both permutations, the sorted order, optimal
+price, tie-breaks, and price-priority allocation without calling the native
+matcher. It commits the batch ID, SHA-256 batch commitment, previous and new
+clearing prices, volume, and fills commitment.
 
-This is a correctness-first scaffold, not yet the optimized verify-only guest
-described in the project design. The guest build and proof have not been run
+The guest scans price levels to verify the clearing price and uses pairwise
+remainder ranking at the marginal allocation level, avoiding guest-side sorts.
+The guest build and proof have not been run
 because the Windows environment has no RISC Zero toolchain; validate them from
 the repository clone in the Ubuntu VM before relying on the proof.
 

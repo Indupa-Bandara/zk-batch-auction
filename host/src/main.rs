@@ -1,4 +1,7 @@
-use batch_auction_matching::{clear_auction, AuctionInput, AuctionPublicValues, Order, Side};
+use batch_auction_matching::{
+    clear_auction, hash_sorted_order_indices, sorted_order_indices, AuctionInput,
+    AuctionPublicValues, Order, Side,
+};
 use batch_auction_methods::{BATCH_AUCTION_GUEST_ELF, BATCH_AUCTION_GUEST_ID};
 use risc0_zkvm::{
     default_prover,
@@ -19,6 +22,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let expected_result = clear_auction(&orders, None)?;
     let input = AuctionInput {
         batch_id: 0,
+        sorted_order_indices: sorted_order_indices(&orders)?,
+        hash_sorted_order_indices: hash_sorted_order_indices(&orders)?,
         orders,
         previous_clearing_price: None,
         expected_result,
@@ -35,6 +40,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let expected_fills_commitment = digest(&bincode::serialize(&input.expected_result.fills)?);
     if public_values.batch_id != input.batch_id
         || public_values.batch_commitment != expected_batch_commitment
+        || public_values.previous_clearing_price != input.previous_clearing_price
         || public_values.clearing_price != input.expected_result.clearing_price
         || public_values.volume != input.expected_result.volume
         || public_values.fills_commitment != expected_fills_commitment

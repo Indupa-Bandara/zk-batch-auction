@@ -26,6 +26,8 @@ pub struct AuctionResult {
 pub struct AuctionInput {
     pub batch_id: u64,
     pub orders: Vec<Order>,
+    pub sorted_order_indices: Vec<u32>,
+    pub hash_sorted_order_indices: Vec<u32>,
     pub previous_clearing_price: Option<u64>,
     pub expected_result: AuctionResult,
 }
@@ -34,6 +36,7 @@ pub struct AuctionInput {
 pub struct AuctionPublicValues {
     pub batch_id: u64,
     pub batch_commitment: [u8; 32],
+    pub previous_clearing_price: Option<u64>,
     pub clearing_price: Option<u64>,
     pub volume: u128,
     pub fills_commitment: [u8; 32],
@@ -44,6 +47,7 @@ pub enum MatchError {
     DuplicateOrderHash,
     ArithmeticOverflow,
     InvalidAllocation,
+    InvalidWitness,
 }
 
 impl std::fmt::Display for MatchError {
@@ -52,6 +56,7 @@ impl std::fmt::Display for MatchError {
             Self::DuplicateOrderHash => "duplicate order hash",
             Self::ArithmeticOverflow => "auction arithmetic overflow",
             Self::InvalidAllocation => "invalid auction allocation",
+            Self::InvalidWitness => "invalid auction witness",
         };
         formatter.write_str(message)
     }
@@ -67,6 +72,15 @@ struct Candidate {
     distance_from_previous: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PriceLevel {
+    price: u64,
+    buy_quantity: u128,
+    sell_quantity: u128,
+    start: usize,
+    end: usize,
+}
+
 impl Candidate {
     fn is_better_than(self, other: Self) -> bool {
         self.volume > other.volume
@@ -78,6 +92,114 @@ impl Candidate {
                             _ => self.price < other.price,
                         })))
     }
+}
+
+pub fn sorted_order_indices(orders: &[Order]) -> Result<Vec<u32>, MatchError> {
+    let mut indices: Vec<usize> = (0..orders.len()).collect();
+    indices.sort_unstable_by(|left, right| compare_orders(orders, *left, *right));
+    to_u32_indices(indices)
+}
+
+pub fn hash_sorted_order_indices(orders: &[Order]) -> Result<Vec<u32>, MatchError> {
+    let mut indices: Vec<usize> = (0..orders.len()).collect();
+    indices.sort_unstable_by(|left, right| compare_order_hashes(orders, *left, *right));
+    to_u32_indices(indices)
+}
+
+fn to_u32_indices(indices: Vec<usize>) -> Result<Vec<u32>, MatchError> {
+    indices
+        .into_iter()
+        .map(|index| u32::try_from(index).map_err(|_| MatchError::ArithmeticOverflow))
+        .collect()
+}
+
+pub fn verify_auction(
+    orders: &[Order],
+    sorted_order_indices: &[u32],
+    hash_sorted_order_indices: &[u32],
+    previous_clearing_price: Option<u64>,
+    claimed_result: &AuctionResult,
+) -> Result<(), MatchError> {
+    if claimed_result.fills.len() != orders.len() {
+        return Err(MatchError::InvalidWitness);
+    }
+
+    let indices = validate_permutation(orders, sorted_order_indices)?;
+    if indices
+        .windows(2)
+        .any(|pair| compare_orders(orders, pair[0], pair[1]).is_gt())
+    {
+        return Err(MatchError::InvalidWitness);
+    }
+
+    let hash_indices = validate_permutation(orders, hash_sorted_order_indices)?;
+    for pair in hash_indices.windows(2) {
+        if compare_order_hashes(orders, pair[0], pair[1]).is_gt() {
+            return Err(MatchError::InvalidWitness);
+        }
+        if orders[pair[0]].order_hash == orders[pair[1]].order_hash {
+            return Err(MatchError::DuplicateOrderHash);
+        }
+    }
+
+    let levels = build_price_levels(orders, &indices)?;
+    let best =
+        best_candidate(&levels, previous_clearing_price)?.filter(|candidate| candidate.volume > 0);
+    let Some(best) = best else {
+        if claimed_result.clearing_price.is_some()
+            || claimed_result.volume != 0
+            || claimed_result.fills.iter().any(|fill| *fill != 0)
+        {
+            return Err(MatchError::InvalidWitness);
+        }
+        return Ok(());
+    };
+
+    if claimed_result.clearing_price != Some(best.price) || claimed_result.volume != best.volume {
+        return Err(MatchError::InvalidWitness);
+    }
+
+    let mut expected_fills = vec![0; orders.len()];
+    allocate_sorted_side(
+        orders,
+        &indices,
+        &levels,
+        best.price,
+        Side::Buy,
+        best.volume,
+        &mut expected_fills,
+    )?;
+    allocate_sorted_side(
+        orders,
+        &indices,
+        &levels,
+        best.price,
+        Side::Sell,
+        best.volume,
+        &mut expected_fills,
+    )?;
+    if expected_fills != claimed_result.fills {
+        return Err(MatchError::InvalidWitness);
+    }
+    Ok(())
+}
+
+fn validate_permutation(orders: &[Order], indices: &[u32]) -> Result<Vec<usize>, MatchError> {
+    if indices.len() != orders.len() {
+        return Err(MatchError::InvalidWitness);
+    }
+
+    let mut seen = vec![false; orders.len()];
+    let mut validated = Vec::with_capacity(indices.len());
+    for index in indices {
+        let index = usize::try_from(*index).map_err(|_| MatchError::InvalidWitness)?;
+        if index >= orders.len() || seen[index] {
+            return Err(MatchError::InvalidWitness);
+        }
+        seen[index] = true;
+        validated.push(index);
+    }
+    Ok(validated)
 }
 
 pub fn clear_auction(
@@ -138,6 +260,229 @@ pub fn clear_auction(
         volume: best.volume,
         fills,
     })
+}
+
+fn compare_orders(orders: &[Order], left: usize, right: usize) -> std::cmp::Ordering {
+    let left_order = &orders[left];
+    let right_order = &orders[right];
+    left_order
+        .limit_price
+        .cmp(&right_order.limit_price)
+        .then_with(|| side_order(left_order.side).cmp(&side_order(right_order.side)))
+        .then_with(|| left_order.order_hash.cmp(&right_order.order_hash))
+}
+
+fn compare_order_hashes(orders: &[Order], left: usize, right: usize) -> std::cmp::Ordering {
+    let left_order = &orders[left];
+    let right_order = &orders[right];
+    left_order
+        .order_hash
+        .cmp(&right_order.order_hash)
+        .then_with(|| side_order(left_order.side).cmp(&side_order(right_order.side)))
+        .then_with(|| left_order.limit_price.cmp(&right_order.limit_price))
+}
+
+fn side_order(side: Side) -> u8 {
+    match side {
+        Side::Buy => 0,
+        Side::Sell => 1,
+    }
+}
+
+fn build_price_levels(
+    orders: &[Order],
+    sorted_order_indices: &[usize],
+) -> Result<Vec<PriceLevel>, MatchError> {
+    let mut levels: Vec<PriceLevel> = Vec::new();
+    for (position, index) in sorted_order_indices.iter().copied().enumerate() {
+        let order = &orders[index];
+        let level = match levels.last_mut() {
+            Some(level) if level.price == order.limit_price => level,
+            _ => {
+                levels.push(PriceLevel {
+                    price: order.limit_price,
+                    buy_quantity: 0,
+                    sell_quantity: 0,
+                    start: position,
+                    end: position + 1,
+                });
+                levels.last_mut().expect("a price level was just added")
+            }
+        };
+        level.end = position + 1;
+        let quantity = u128::from(order.quantity);
+        match order.side {
+            Side::Buy => {
+                level.buy_quantity = level
+                    .buy_quantity
+                    .checked_add(quantity)
+                    .ok_or(MatchError::ArithmeticOverflow)?;
+            }
+            Side::Sell => {
+                level.sell_quantity = level
+                    .sell_quantity
+                    .checked_add(quantity)
+                    .ok_or(MatchError::ArithmeticOverflow)?;
+            }
+        }
+    }
+    Ok(levels)
+}
+
+fn best_candidate(
+    levels: &[PriceLevel],
+    previous_clearing_price: Option<u64>,
+) -> Result<Option<Candidate>, MatchError> {
+    let mut demand = levels.iter().try_fold(0_u128, |total, level| {
+        total
+            .checked_add(level.buy_quantity)
+            .ok_or(MatchError::ArithmeticOverflow)
+    })?;
+    let mut supply = 0_u128;
+    let mut level_index = 0;
+    let mut previous_price = previous_clearing_price;
+    let mut best = None;
+
+    while level_index < levels.len() || previous_price.is_some() {
+        let next_level_price = levels.get(level_index).map(|level| level.price);
+        let price = match (previous_price, next_level_price) {
+            (Some(previous), Some(level_price)) if previous <= level_price => {
+                previous_price = None;
+                previous
+            }
+            (_, Some(level_price)) => level_price,
+            (Some(previous), None) => {
+                previous_price = None;
+                previous
+            }
+            (None, None) => break,
+        };
+
+        while level_index < levels.len() && levels[level_index].price < price {
+            demand = demand
+                .checked_sub(levels[level_index].buy_quantity)
+                .ok_or(MatchError::InvalidWitness)?;
+            supply = supply
+                .checked_add(levels[level_index].sell_quantity)
+                .ok_or(MatchError::ArithmeticOverflow)?;
+            level_index += 1;
+        }
+
+        if level_index < levels.len() && levels[level_index].price == price {
+            supply = supply
+                .checked_add(levels[level_index].sell_quantity)
+                .ok_or(MatchError::ArithmeticOverflow)?;
+        }
+        let candidate = Candidate {
+            price,
+            volume: demand.min(supply),
+            imbalance: demand.abs_diff(supply),
+            distance_from_previous: previous_clearing_price
+                .map(|previous| price.abs_diff(previous)),
+        };
+        if best
+            .map(|current: Candidate| candidate.is_better_than(current))
+            .unwrap_or(true)
+        {
+            best = Some(candidate);
+        }
+
+        if level_index < levels.len() && levels[level_index].price == price {
+            demand = demand
+                .checked_sub(levels[level_index].buy_quantity)
+                .ok_or(MatchError::InvalidWitness)?;
+            level_index += 1;
+        }
+    }
+    Ok(best)
+}
+
+fn allocate_sorted_side(
+    orders: &[Order],
+    sorted_order_indices: &[usize],
+    levels: &[PriceLevel],
+    clearing_price: u64,
+    side: Side,
+    target: u128,
+    fills: &mut [u64],
+) -> Result<(), MatchError> {
+    let eligible_total = levels.iter().try_fold(0_u128, |total, level| {
+        if level_is_eligible(level.price, side, clearing_price) {
+            total
+                .checked_add(level_quantity(level, side))
+                .ok_or(MatchError::ArithmeticOverflow)
+        } else {
+            Ok(total)
+        }
+    })?;
+    if target > eligible_total {
+        return Err(MatchError::InvalidWitness);
+    }
+
+    if target == eligible_total {
+        for index in sorted_order_indices {
+            let order = &orders[*index];
+            if is_eligible(order, side, clearing_price) {
+                fills[*index] = order.quantity;
+            }
+        }
+        return Ok(());
+    }
+
+    let mut remaining = target;
+    let mut allocate_level = |level: &PriceLevel| -> Result<(), MatchError> {
+        if !level_is_eligible(level.price, side, clearing_price) || remaining == 0 {
+            return Ok(());
+        }
+
+        let level_total = level_quantity(level, side);
+        let level_indices: Vec<usize> = sorted_order_indices[level.start..level.end]
+            .iter()
+            .copied()
+            .filter(|index| orders[*index].side == side)
+            .collect();
+        if level_total <= remaining {
+            for index in level_indices {
+                fills[index] = orders[index].quantity;
+            }
+            remaining -= level_total;
+        } else {
+            allocate_pro_rata(orders, &level_indices, remaining, fills)?;
+            remaining = 0;
+        }
+        Ok(())
+    };
+
+    match side {
+        Side::Buy => {
+            for level in levels.iter().rev() {
+                allocate_level(level)?;
+            }
+        }
+        Side::Sell => {
+            for level in levels {
+                allocate_level(level)?;
+            }
+        }
+    }
+    if remaining != 0 {
+        return Err(MatchError::InvalidWitness);
+    }
+    Ok(())
+}
+
+fn level_quantity(level: &PriceLevel, side: Side) -> u128 {
+    match side {
+        Side::Buy => level.buy_quantity,
+        Side::Sell => level.sell_quantity,
+    }
+}
+
+fn level_is_eligible(price: u64, side: Side, clearing_price: u64) -> bool {
+    match side {
+        Side::Buy => price >= clearing_price,
+        Side::Sell => price <= clearing_price,
+    }
 }
 
 fn eligible_totals(orders: &[Order], price: u64) -> Result<(u128, u128), MatchError> {
@@ -257,7 +602,7 @@ fn allocate_pro_rata(
         return Err(MatchError::InvalidAllocation);
     }
 
-    let mut remainders = Vec::with_capacity(indices.len());
+    let mut quotas = Vec::with_capacity(indices.len());
     let mut assigned = 0_u128;
     for index in indices {
         let order = &orders[*index];
@@ -269,20 +614,29 @@ fn allocate_pro_rata(
         assigned = assigned
             .checked_add(base)
             .ok_or(MatchError::ArithmeticOverflow)?;
-        remainders.push((product % marginal_total, order.order_hash, *index));
+        quotas.push((product % marginal_total, order.order_hash, *index));
     }
 
-    let leftover =
-        usize::try_from(target - assigned).map_err(|_| MatchError::ArithmeticOverflow)?;
-    remainders
-        .sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
-    if leftover > remainders.len() {
+    let unallocated = target
+        .checked_sub(assigned)
+        .ok_or(MatchError::InvalidAllocation)?;
+    let leftover = usize::try_from(unallocated).map_err(|_| MatchError::ArithmeticOverflow)?;
+    if leftover > quotas.len() {
         return Err(MatchError::InvalidAllocation);
     }
-    for (_, _, index) in remainders.into_iter().take(leftover) {
-        fills[index] = fills[index]
-            .checked_add(1)
-            .ok_or(MatchError::ArithmeticOverflow)?;
+    for (remainder, order_hash, index) in &quotas {
+        let rank = quotas
+            .iter()
+            .filter(|(other_remainder, other_hash, _)| {
+                other_remainder > remainder
+                    || (other_remainder == remainder && other_hash < order_hash)
+            })
+            .count();
+        if rank < leftover {
+            fills[*index] = fills[*index]
+                .checked_add(1)
+                .ok_or(MatchError::ArithmeticOverflow)?;
+        }
     }
     Ok(())
 }
@@ -328,6 +682,18 @@ mod tests {
         assert_eq!(result.clearing_price, Some(101));
         assert_eq!(result.volume, 15);
         assert_eq!(result.fills, [10, 5, 0, 6, 7, 2]);
+        let sorted_indices = sorted_order_indices(&orders).unwrap();
+        let hash_sorted_indices = hash_sorted_order_indices(&orders).unwrap();
+        assert_eq!(
+            verify_auction(
+                &orders,
+                &sorted_indices,
+                &hash_sorted_indices,
+                None,
+                &result,
+            ),
+            Ok(())
+        );
     }
 
     #[test]
@@ -391,6 +757,99 @@ mod tests {
         assert_eq!(
             clear_auction(&orders, None),
             Err(MatchError::DuplicateOrderHash)
+        );
+        let price_sorted = sorted_order_indices(&orders).unwrap();
+        let hash_sorted = hash_sorted_order_indices(&orders).unwrap();
+        let result = AuctionResult {
+            clearing_price: Some(100),
+            volume: 1,
+            fills: vec![1, 0],
+        };
+        assert_eq!(
+            verify_auction(&orders, &price_sorted, &hash_sorted, None, &result),
+            Err(MatchError::DuplicateOrderHash)
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_tampered_fills_and_invalid_order_witnesses() {
+        let orders = [order(Side::Buy, 100, 2, 1), order(Side::Sell, 100, 1, 2)];
+        let result = clear_auction(&orders, None).unwrap();
+        let sorted_indices = sorted_order_indices(&orders).unwrap();
+        let hash_sorted_indices = hash_sorted_order_indices(&orders).unwrap();
+
+        let mut tampered_result = result.clone();
+        tampered_result.fills[0] -= 1;
+        assert_eq!(
+            verify_auction(
+                &orders,
+                &sorted_indices,
+                &hash_sorted_indices,
+                None,
+                &tampered_result,
+            ),
+            Err(MatchError::InvalidWitness)
+        );
+
+        let mut tampered_price = result.clone();
+        tampered_price.clearing_price = Some(99);
+        assert_eq!(
+            verify_auction(
+                &orders,
+                &sorted_indices,
+                &hash_sorted_indices,
+                None,
+                &tampered_price,
+            ),
+            Err(MatchError::InvalidWitness)
+        );
+
+        let duplicate_indices = [sorted_indices[0], sorted_indices[0]];
+        assert_eq!(
+            verify_auction(
+                &orders,
+                &duplicate_indices,
+                &hash_sorted_indices,
+                None,
+                &result,
+            ),
+            Err(MatchError::InvalidWitness)
+        );
+
+        let unsorted_indices = [sorted_indices[1], sorted_indices[0]];
+        assert_eq!(
+            verify_auction(
+                &orders,
+                &unsorted_indices,
+                &hash_sorted_indices,
+                None,
+                &result,
+            ),
+            Err(MatchError::InvalidWitness)
+        );
+
+        let duplicate_hash_indices = [hash_sorted_indices[0], hash_sorted_indices[0]];
+        assert_eq!(
+            verify_auction(
+                &orders,
+                &sorted_indices,
+                &duplicate_hash_indices,
+                None,
+                &result,
+            ),
+            Err(MatchError::InvalidWitness)
+        );
+
+        let unsorted_hash_indices = [hash_sorted_indices[1], hash_sorted_indices[0]];
+        assert_eq!(
+            verify_auction(
+                &orders,
+                &sorted_indices,
+                &unsorted_hash_indices,
+                None,
+                &result,
+            ),
+            Err(MatchError::InvalidWitness)
         );
     }
 
@@ -481,6 +940,18 @@ mod tests {
             let result = clear_auction(&orders, previous_clearing_price).unwrap();
             let expected = reference_result(&orders, previous_clearing_price);
             prop_assert_eq!((result.clearing_price, result.volume), expected);
+            let sorted_indices = sorted_order_indices(&orders).unwrap();
+            let hash_sorted_indices = hash_sorted_order_indices(&orders).unwrap();
+            prop_assert_eq!(
+                verify_auction(
+                    &orders,
+                    &sorted_indices,
+                    &hash_sorted_indices,
+                    previous_clearing_price,
+                    &result,
+                ),
+                Ok(())
+            );
 
             let mut buy_fills = 0_u128;
             let mut sell_fills = 0_u128;
@@ -504,6 +975,18 @@ mod tests {
             let reversed_orders: Vec<Order> = orders.iter().cloned().rev().collect();
             let reversed_result =
                 clear_auction(&reversed_orders, previous_clearing_price).unwrap();
+            let reversed_sorted_indices = sorted_order_indices(&reversed_orders).unwrap();
+            let reversed_hash_sorted_indices = hash_sorted_order_indices(&reversed_orders).unwrap();
+            prop_assert_eq!(
+                verify_auction(
+                    &reversed_orders,
+                    &reversed_sorted_indices,
+                    &reversed_hash_sorted_indices,
+                    previous_clearing_price,
+                    &reversed_result,
+                ),
+                Ok(())
+            );
             let fills_by_hash: BTreeMap<_, _> = orders
                 .iter()
                 .zip(&result.fills)
