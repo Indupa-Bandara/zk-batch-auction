@@ -1,20 +1,26 @@
 # RISC Zero Guest
 
 The first proof pipeline uses `risc0-zkvm` 3.1.0 and `risc0-build` 3.0.7. The
-RISC Zero 3.1.0 release pins `risc0-build` to 3.0.7. The host and guest share the
-`batch-auction-matching` crate. The host supplies price-sorted and hash-sorted order-index permutations and a
-claimed result; the guest checks both permutations, the sorted order, optimal
-price, tie-breaks, and price-priority allocation without calling the native
-matcher. It commits the batch ID, SHA-256 batch commitment, previous and new
-clearing prices, volume, and fills commitment.
+RISC Zero 3.1.0 release pins `risc0-build` to 3.0.7. The host and guest share
+the `batch-auction-matching` crate. The host supplies price-sorted and
+hash-sorted order-index permutations and a claimed result; the guest validates
+Ed25519 signatures, order hashes, batch eligibility and expiry, then checks
+both permutations, the sorted order, optimal price, tie-breaks, and
+price-priority allocation without calling the native matcher. It commits the
+batch ID and timestamp, SHA-256 batch commitment, previous and new clearing
+prices, volume, and fills commitment.
 Orders and `(order hash, fill)` pairs are encoded in hash-sorted order, so the
 commitments do not depend on the input vector order.
 
+The timestamp is supplied by the prover; an integrating settlement layer must
+check it against a trusted clock. Nonce freshness and account balances are not
+yet part of this proof.
+
 The guest scans price levels to verify the clearing price and uses pairwise
 remainder ranking at the marginal allocation level, avoiding guest-side sorts.
-The guest build and proof have not been run
-because the Windows environment has no RISC Zero toolchain; validate them from
-the repository clone in the Ubuntu VM before relying on the proof.
+The guest build and proof have not been run because the Windows environment has
+no RISC Zero toolchain; validate them from the repository clone in the Ubuntu
+VM before relying on the proof.
 
 ## Linux toolchain
 

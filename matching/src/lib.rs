@@ -1,4 +1,6 @@
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Side {
@@ -8,10 +10,15 @@ pub enum Side {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Order {
+    pub account_id: [u8; 32],
     pub side: Side,
     pub limit_price: u64,
     pub quantity: u64,
+    pub nonce: u64,
+    pub batch_id: u64,
+    pub expiry: u64,
     pub order_hash: [u8; 32],
+    pub signature: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -25,6 +32,7 @@ pub struct AuctionResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AuctionInput {
     pub batch_id: u64,
+    pub batch_timestamp: u64,
     pub orders: Vec<Order>,
     pub sorted_order_indices: Vec<u32>,
     pub hash_sorted_order_indices: Vec<u32>,
@@ -35,6 +43,7 @@ pub struct AuctionInput {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AuctionPublicValues {
     pub batch_id: u64,
+    pub batch_timestamp: u64,
     pub batch_commitment: [u8; 32],
     pub previous_clearing_price: Option<u64>,
     pub clearing_price: Option<u64>,
@@ -49,6 +58,12 @@ pub enum MatchError {
     InvalidAllocation,
     InvalidWitness,
     SerializationError,
+    InvalidAccountId,
+    InvalidSignature,
+    InvalidOrderHash,
+    InvalidOrder,
+    WrongBatch,
+    ExpiredOrder,
 }
 
 impl std::fmt::Display for MatchError {
@@ -59,12 +74,70 @@ impl std::fmt::Display for MatchError {
             Self::InvalidAllocation => "invalid auction allocation",
             Self::InvalidWitness => "invalid auction witness",
             Self::SerializationError => "failed to serialize auction commitment",
+            Self::InvalidAccountId => "invalid Ed25519 account public key",
+            Self::InvalidSignature => "invalid order signature",
+            Self::InvalidOrderHash => "order hash does not match signed fields",
+            Self::InvalidOrder => "invalid order fields",
+            Self::WrongBatch => "order is for a different batch",
+            Self::ExpiredOrder => "order is expired",
         };
         formatter.write_str(message)
     }
 }
 
 impl std::error::Error for MatchError {}
+
+const ORDER_DOMAIN: &[u8] = b"batch-auction-exchange/order/v1\0";
+
+pub fn order_signing_bytes(order: &Order) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(ORDER_DOMAIN.len() + 32 + 1 + 5 * 8);
+    bytes.extend_from_slice(ORDER_DOMAIN);
+    bytes.extend_from_slice(&order.account_id);
+    bytes.push(match order.side {
+        Side::Buy => 0,
+        Side::Sell => 1,
+    });
+    bytes.extend_from_slice(&order.limit_price.to_be_bytes());
+    bytes.extend_from_slice(&order.quantity.to_be_bytes());
+    bytes.extend_from_slice(&order.nonce.to_be_bytes());
+    bytes.extend_from_slice(&order.batch_id.to_be_bytes());
+    bytes.extend_from_slice(&order.expiry.to_be_bytes());
+    bytes
+}
+
+pub fn canonical_order_hash(order: &Order) -> [u8; 32] {
+    Sha256::digest(order_signing_bytes(order)).into()
+}
+
+pub fn validate_signed_orders(
+    orders: &[Order],
+    batch_id: u64,
+    batch_timestamp: u64,
+) -> Result<(), MatchError> {
+    for order in orders {
+        if order.batch_id != batch_id {
+            return Err(MatchError::WrongBatch);
+        }
+        if batch_timestamp >= order.expiry {
+            return Err(MatchError::ExpiredOrder);
+        }
+        if order.quantity == 0 {
+            return Err(MatchError::InvalidOrder);
+        }
+        if canonical_order_hash(order) != order.order_hash {
+            return Err(MatchError::InvalidOrderHash);
+        }
+
+        let verifying_key = VerifyingKey::from_bytes(&order.account_id)
+            .map_err(|_| MatchError::InvalidAccountId)?;
+        let signature =
+            Signature::from_slice(&order.signature).map_err(|_| MatchError::InvalidSignature)?;
+        verifying_key
+            .verify_strict(&order_signing_bytes(order), &signature)
+            .map_err(|_| MatchError::InvalidSignature)?;
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Candidate {
@@ -687,6 +760,7 @@ fn is_eligible(order: &Order, side: Side, price: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
     use proptest::prelude::*;
     use std::collections::BTreeMap;
 
@@ -694,11 +768,93 @@ mod tests {
         let mut order_hash = [0; 32];
         order_hash[31] = hash;
         Order {
+            account_id: [hash; 32],
             side,
             limit_price,
             quantity,
+            nonce: u64::from(hash),
+            batch_id: 0,
+            expiry: u64::MAX,
             order_hash,
+            signature: vec![0; 64],
         }
+    }
+
+    fn signed_order(
+        seed: u8,
+        side: Side,
+        limit_price: u64,
+        quantity: u64,
+        nonce: u64,
+        batch_id: u64,
+        expiry: u64,
+    ) -> Order {
+        let signing_key = SigningKey::from_bytes(&[seed; 32]);
+        let mut order = Order {
+            account_id: signing_key.verifying_key().to_bytes(),
+            side,
+            limit_price,
+            quantity,
+            nonce,
+            batch_id,
+            expiry,
+            order_hash: [0; 32],
+            signature: vec![0; 64],
+        };
+        order.order_hash = canonical_order_hash(&order);
+        order.signature = signing_key
+            .sign(&order_signing_bytes(&order))
+            .to_bytes()
+            .to_vec();
+        order
+    }
+
+    #[test]
+    fn signed_orders_bind_fields_batch_and_expiry() {
+        let order = signed_order(7, Side::Buy, 100, 2, 4, 9, 101);
+        assert_eq!(
+            validate_signed_orders(std::slice::from_ref(&order), 9, 100),
+            Ok(())
+        );
+
+        assert_eq!(
+            validate_signed_orders(std::slice::from_ref(&order), 10, 100),
+            Err(MatchError::WrongBatch)
+        );
+        assert_eq!(
+            validate_signed_orders(std::slice::from_ref(&order), 9, 101),
+            Err(MatchError::ExpiredOrder)
+        );
+
+        let mut changed_fields = order.clone();
+        changed_fields.limit_price += 1;
+        assert_eq!(
+            validate_signed_orders(&[changed_fields], 9, 100),
+            Err(MatchError::InvalidOrderHash)
+        );
+
+        let mut changed_signature = order.clone();
+        changed_signature.signature[0] ^= 1;
+        assert_eq!(
+            validate_signed_orders(&[changed_signature], 9, 100),
+            Err(MatchError::InvalidSignature)
+        );
+
+        let mut malformed_signature = order;
+        malformed_signature.signature.pop();
+        assert_eq!(
+            validate_signed_orders(&[malformed_signature], 9, 100),
+            Err(MatchError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn signed_orders_reject_zero_quantity() {
+        let order = signed_order(8, Side::Sell, 100, 0, 1, 9, 101);
+        assert_eq!(
+            validate_signed_orders(&[order], 9, 100),
+            Err(MatchError::InvalidOrder)
+        );
     }
 
     #[test]
@@ -992,10 +1148,15 @@ mod tests {
                         &u64::try_from(index).unwrap().to_be_bytes(),
                     );
                     Order {
+                        account_id: [u8::try_from(index).unwrap(); 32],
                         side: if is_buy { Side::Buy } else { Side::Sell },
                         limit_price,
                         quantity,
+                        nonce: u64::try_from(index).unwrap(),
+                        batch_id: 0,
+                        expiry: u64::MAX,
                         order_hash,
+                        signature: vec![0; 64],
                     }
                 })
                 .collect();

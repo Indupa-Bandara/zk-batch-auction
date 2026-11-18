@@ -1,8 +1,8 @@
 #![no_main]
 
 use batch_auction_matching::{
-    canonical_fills_bytes, canonical_order_batch_bytes, verify_auction, AuctionInput,
-    AuctionPublicValues,
+    canonical_fills_bytes, canonical_order_batch_bytes, validate_signed_orders, verify_auction,
+    AuctionInput, AuctionPublicValues,
 };
 use risc0_zkvm::{
     guest::env,
@@ -13,6 +13,8 @@ risc0_zkvm::guest::entry!(main);
 
 fn main() {
     let input: AuctionInput = env::read();
+    validate_signed_orders(&input.orders, input.batch_id, input.batch_timestamp)
+        .expect("an order is unsigned, expired, or for a different batch");
     verify_auction(
         &input.orders,
         &input.sorted_order_indices,
@@ -24,6 +26,7 @@ fn main() {
 
     let public_values = AuctionPublicValues {
         batch_id: input.batch_id,
+        batch_timestamp: input.batch_timestamp,
         batch_commitment: digest(
             &canonical_order_batch_bytes(&input.orders, &input.hash_sorted_order_indices)
                 .expect("order commitment must serialize"),

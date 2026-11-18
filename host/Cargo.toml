@@ -6,4 +6,6 @@ edition = "2021"
 [dependencies]
 batch-auction-matching = { path = "../matching" }
 batch-auction-methods = { path = "../methods" }
+ed25519-dalek = { version = "=2.1.1", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 risc0-zkvm = { version = "=3.1.0", default-features = false, features = ["prove"] }

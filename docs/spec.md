@@ -10,25 +10,38 @@ It specifies matching only; it does not imply token custody or order privacy.
 
 Each order contains:
 
-- account identifier
+- account identifier (the Ed25519 public key)
 - side: buy or sell
 - limit price in ticks
 - quantity in lots
 - nonce
 - batch identifier
-- expiry
-- signature
+- expiry as a Unix timestamp in seconds
+- 64-byte Ed25519 signature
 
 Only limit orders are in scope for the initial matcher. Market orders, if added
 later, must use explicit configured price bounds rather than unbounded sentinel
 values.
 
-An order is eligible only for its specified batch and while unexpired. Signature
-and nonce validation are separate acceptance checks; invalid orders are rejected
-before matching. The canonical order hash is computed from all signed order
-fields, excluding the signature bytes, and is used to break allocation ties.
-The signature encoding and hash implementation will be fixed when the signing
-format is selected.
+An order is eligible only for its specified batch and while unexpired. It is
+valid at batch timestamp `t` only when `t < expiry`. The batch timestamp is a
+public proof value; a settlement layer must check it against a trusted clock.
+
+The signed message is the following concatenation:
+
+1. `batch-auction-exchange/order/v1` followed by a zero byte;
+2. the 32-byte account public key;
+3. one side byte (`0` for buy, `1` for sell);
+4. limit price, quantity, nonce, batch identifier, and expiry, each as an
+  unsigned 64-bit big-endian integer.
+
+The Ed25519 signature covers this message. The canonical order hash is SHA-256
+of the same message, excluding signature bytes, and is used to break allocation
+ties. An included batch is rejected if any order has an invalid signature or
+hash, mismatched batch identifier, zero quantity, or expired timestamp.
+
+Nonce freshness and uniqueness require account state and are not yet checked by
+the matcher; they are part of the later state-transition proof.
 
 ## Clearing price
 

@@ -8,7 +8,10 @@ path = "src/lib.rs"
 
 [dependencies]
 bincode = "1"
+ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
+sha2 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
+ed25519-dalek = { version = "=2.1.1", features = ["rand_core"] }
 proptest = "1"
