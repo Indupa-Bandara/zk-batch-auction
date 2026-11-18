@@ -1,12 +1,12 @@
-use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Side {
     Buy,
     Sell,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Order {
     pub side: Side,
     pub limit_price: u64,
@@ -14,12 +14,29 @@ pub struct Order {
     pub order_hash: [u8; 32],
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AuctionResult {
     pub clearing_price: Option<u64>,
     pub volume: u128,
     /// Fill quantities are in the same order as the input orders.
     pub fills: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AuctionInput {
+    pub batch_id: u64,
+    pub orders: Vec<Order>,
+    pub previous_clearing_price: Option<u64>,
+    pub expected_result: AuctionResult,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AuctionPublicValues {
+    pub batch_id: u64,
+    pub batch_commitment: [u8; 32],
+    pub clearing_price: Option<u64>,
+    pub volume: u128,
+    pub fills_commitment: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,6 +45,19 @@ pub enum MatchError {
     ArithmeticOverflow,
     InvalidAllocation,
 }
+
+impl std::fmt::Display for MatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::DuplicateOrderHash => "duplicate order hash",
+            Self::ArithmeticOverflow => "auction arithmetic overflow",
+            Self::InvalidAllocation => "invalid auction allocation",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for MatchError {}
 
 #[derive(Clone, Copy, Debug)]
 struct Candidate {
@@ -54,11 +84,10 @@ pub fn clear_auction(
     orders: &[Order],
     previous_clearing_price: Option<u64>,
 ) -> Result<AuctionResult, MatchError> {
-    let mut hashes = HashSet::with_capacity(orders.len());
-    for order in orders {
-        if !hashes.insert(order.order_hash) {
-            return Err(MatchError::DuplicateOrderHash);
-        }
+    let mut hashes: Vec<[u8; 32]> = orders.iter().map(|order| order.order_hash).collect();
+    hashes.sort_unstable();
+    if hashes.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(MatchError::DuplicateOrderHash);
     }
 
     let mut prices: Vec<u64> = orders.iter().map(|order| order.limit_price).collect();
