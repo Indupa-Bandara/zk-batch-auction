@@ -22,6 +22,20 @@ pub struct Order {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AccountState {
+    pub account_id: [u8; 32],
+    pub next_nonce: u64,
+    pub base_balance: u128,
+    pub quote_balance: u128,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AccountStateTransition {
+    pub previous_root: [u8; 32],
+    pub new_root: [u8; 32],
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AuctionResult {
     pub clearing_price: Option<u64>,
     pub volume: u128,
@@ -34,6 +48,7 @@ pub struct AuctionInput {
     pub batch_id: u64,
     pub batch_timestamp: u64,
     pub orders: Vec<Order>,
+    pub account_states: Vec<AccountState>,
     pub sorted_order_indices: Vec<u32>,
     pub hash_sorted_order_indices: Vec<u32>,
     pub previous_clearing_price: Option<u64>,
@@ -45,6 +60,8 @@ pub struct AuctionPublicValues {
     pub batch_id: u64,
     pub batch_timestamp: u64,
     pub batch_commitment: [u8; 32],
+    pub previous_account_root: [u8; 32],
+    pub new_account_root: [u8; 32],
     pub previous_clearing_price: Option<u64>,
     pub clearing_price: Option<u64>,
     pub volume: u128,
@@ -64,6 +81,9 @@ pub enum MatchError {
     InvalidOrder,
     WrongBatch,
     ExpiredOrder,
+    InvalidAccountState,
+    NonceMismatch,
+    InsufficientBalance,
 }
 
 impl std::fmt::Display for MatchError {
@@ -80,6 +100,9 @@ impl std::fmt::Display for MatchError {
             Self::InvalidOrder => "invalid order fields",
             Self::WrongBatch => "order is for a different batch",
             Self::ExpiredOrder => "order is expired",
+            Self::InvalidAccountState => "invalid account state",
+            Self::NonceMismatch => "account nonce sequence is invalid",
+            Self::InsufficientBalance => "account balance is insufficient",
         };
         formatter.write_str(message)
     }
@@ -137,6 +160,158 @@ pub fn validate_signed_orders(
             .map_err(|_| MatchError::InvalidSignature)?;
     }
     Ok(())
+}
+
+pub fn account_state_root(accounts: &[AccountState]) -> Result<[u8; 32], MatchError> {
+    if accounts
+        .windows(2)
+        .any(|pair| pair[0].account_id >= pair[1].account_id)
+    {
+        return Err(MatchError::InvalidAccountState);
+    }
+
+    let mut level: Vec<[u8; 32]> = accounts.iter().map(account_leaf_hash).collect();
+    if level.is_empty() {
+        return Ok(Sha256::digest(b"batch-auction-exchange/account-empty/v1\0").into());
+    }
+
+    while level.len() > 1 {
+        let mut parent_level = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            let right = pair.get(1).unwrap_or(&pair[0]);
+            let mut node = Vec::with_capacity(65);
+            node.extend_from_slice(b"batch-auction-exchange/account-node/v1\0");
+            node.extend_from_slice(&pair[0]);
+            node.extend_from_slice(right);
+            parent_level.push(Sha256::digest(node).into());
+        }
+        level = parent_level;
+    }
+
+    Ok(level[0])
+}
+
+pub fn apply_account_state_transition(
+    accounts: &[AccountState],
+    orders: &[Order],
+    result: &AuctionResult,
+) -> Result<AccountStateTransition, MatchError> {
+    if orders.len() != result.fills.len() {
+        return Err(MatchError::InvalidWitness);
+    }
+
+    let previous_root = account_state_root(accounts)?;
+    let mut next_accounts = accounts.to_vec();
+    let mut order_counts = vec![0_u64; accounts.len()];
+    let mut deltas = vec![BalanceDelta::default(); accounts.len()];
+
+    for (order, fill) in orders.iter().zip(&result.fills) {
+        if *fill > order.quantity {
+            return Err(MatchError::InvalidAllocation);
+        }
+        let account_index = accounts
+            .binary_search_by_key(&order.account_id, |account| account.account_id)
+            .map_err(|_| MatchError::InvalidAccountState)?;
+        order_counts[account_index] = order_counts[account_index]
+            .checked_add(1)
+            .ok_or(MatchError::ArithmeticOverflow)?;
+
+        if *fill == 0 {
+            continue;
+        }
+        let clearing_price = result.clearing_price.ok_or(MatchError::InvalidAllocation)?;
+        let notional = u128::from(*fill)
+            .checked_mul(u128::from(clearing_price))
+            .ok_or(MatchError::ArithmeticOverflow)?;
+        match order.side {
+            Side::Buy => {
+                deltas[account_index].base_credit = deltas[account_index]
+                    .base_credit
+                    .checked_add(u128::from(*fill))
+                    .ok_or(MatchError::ArithmeticOverflow)?;
+                deltas[account_index].quote_debit = deltas[account_index]
+                    .quote_debit
+                    .checked_add(notional)
+                    .ok_or(MatchError::ArithmeticOverflow)?;
+            }
+            Side::Sell => {
+                deltas[account_index].base_debit = deltas[account_index]
+                    .base_debit
+                    .checked_add(u128::from(*fill))
+                    .ok_or(MatchError::ArithmeticOverflow)?;
+                deltas[account_index].quote_credit = deltas[account_index]
+                    .quote_credit
+                    .checked_add(notional)
+                    .ok_or(MatchError::ArithmeticOverflow)?;
+            }
+        }
+    }
+
+    for (account_index, account) in accounts.iter().enumerate() {
+        let order_count = order_counts[account_index];
+        if order_count == 0 {
+            continue;
+        }
+
+        let nonce_end = account
+            .next_nonce
+            .checked_add(order_count)
+            .ok_or(MatchError::ArithmeticOverflow)?;
+        for (index, order) in orders.iter().enumerate() {
+            if order.account_id != account.account_id {
+                continue;
+            }
+            if order.nonce < account.next_nonce || order.nonce >= nonce_end {
+                return Err(MatchError::NonceMismatch);
+            }
+            if orders[index + 1..]
+                .iter()
+                .any(|other| other.account_id == order.account_id && other.nonce == order.nonce)
+            {
+                return Err(MatchError::NonceMismatch);
+            }
+        }
+
+        let delta = deltas[account_index];
+        let next_account = &mut next_accounts[account_index];
+        next_account.next_nonce = nonce_end;
+        next_account.base_balance = account
+            .base_balance
+            .checked_add(delta.base_credit)
+            .ok_or(MatchError::ArithmeticOverflow)?
+            .checked_sub(delta.base_debit)
+            .ok_or(MatchError::InsufficientBalance)?;
+        next_account.quote_balance = account
+            .quote_balance
+            .checked_add(delta.quote_credit)
+            .ok_or(MatchError::ArithmeticOverflow)?
+            .checked_sub(delta.quote_debit)
+            .ok_or(MatchError::InsufficientBalance)?;
+    }
+
+    let new_root = account_state_root(&next_accounts)?;
+    Ok(AccountStateTransition {
+        previous_root,
+        new_root,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BalanceDelta {
+    base_credit: u128,
+    base_debit: u128,
+    quote_credit: u128,
+    quote_debit: u128,
+}
+
+fn account_leaf_hash(account: &AccountState) -> [u8; 32] {
+    let mut leaf = Vec::with_capacity(94);
+    leaf.extend_from_slice(b"batch-auction-exchange/account-leaf/v1\0");
+    leaf.extend_from_slice(&account.account_id);
+    leaf.extend_from_slice(&account.next_nonce.to_be_bytes());
+    leaf.extend_from_slice(&account.base_balance.to_be_bytes());
+    leaf.extend_from_slice(&account.quote_balance.to_be_bytes());
+    Sha256::digest(leaf).into()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -854,6 +1029,148 @@ mod tests {
         assert_eq!(
             validate_signed_orders(&[order], 9, 100),
             Err(MatchError::InvalidOrder)
+        );
+    }
+
+    #[test]
+    fn account_state_transition_nets_fills_and_advances_nonces() {
+        let orders = [
+            signed_order(11, Side::Buy, 10, 2, 5, 9, 101),
+            signed_order(22, Side::Sell, 10, 2, 3, 9, 101),
+        ];
+        let result = clear_auction(&orders, None).unwrap();
+        let mut accounts = vec![
+            AccountState {
+                account_id: orders[0].account_id,
+                next_nonce: 5,
+                base_balance: 0,
+                quote_balance: 20,
+            },
+            AccountState {
+                account_id: orders[1].account_id,
+                next_nonce: 3,
+                base_balance: 2,
+                quote_balance: 0,
+            },
+        ];
+        accounts.sort_unstable_by_key(|account| account.account_id);
+        let mut updated_accounts = accounts.clone();
+
+        let transition = apply_account_state_transition(&accounts, &orders, &result).unwrap();
+
+        for account in &mut updated_accounts {
+            if account.account_id == orders[0].account_id {
+                account.next_nonce = 6;
+                account.base_balance = 2;
+                account.quote_balance = 0;
+            } else {
+                account.next_nonce = 4;
+                account.base_balance = 0;
+                account.quote_balance = 20;
+            }
+        }
+        assert_eq!(
+            transition.previous_root,
+            account_state_root(&accounts).unwrap()
+        );
+        assert_eq!(
+            transition.new_root,
+            account_state_root(&updated_accounts).unwrap()
+        );
+        assert_ne!(transition.previous_root, transition.new_root);
+    }
+
+    #[test]
+    fn account_state_transition_rejects_insufficient_net_balance() {
+        let orders = [
+            signed_order(11, Side::Buy, 10, 2, 5, 9, 101),
+            signed_order(22, Side::Sell, 10, 2, 3, 9, 101),
+        ];
+        let result = clear_auction(&orders, None).unwrap();
+        let mut accounts = vec![
+            AccountState {
+                account_id: orders[0].account_id,
+                next_nonce: 5,
+                base_balance: 0,
+                quote_balance: 19,
+            },
+            AccountState {
+                account_id: orders[1].account_id,
+                next_nonce: 3,
+                base_balance: 2,
+                quote_balance: 0,
+            },
+        ];
+        accounts.sort_unstable_by_key(|account| account.account_id);
+
+        assert_eq!(
+            apply_account_state_transition(&accounts, &orders, &result),
+            Err(MatchError::InsufficientBalance)
+        );
+    }
+
+    #[test]
+    fn account_state_transition_consumes_nonces_for_unfilled_orders() {
+        let orders = [
+            signed_order(11, Side::Buy, 9, 1, 5, 9, 101),
+            signed_order(22, Side::Sell, 10, 1, 3, 9, 101),
+        ];
+        let result = clear_auction(&orders, None).unwrap();
+        let mut accounts = vec![
+            AccountState {
+                account_id: orders[0].account_id,
+                next_nonce: 5,
+                base_balance: 0,
+                quote_balance: 20,
+            },
+            AccountState {
+                account_id: orders[1].account_id,
+                next_nonce: 3,
+                base_balance: 2,
+                quote_balance: 0,
+            },
+        ];
+        accounts.sort_unstable_by_key(|account| account.account_id);
+        let transition = apply_account_state_transition(&accounts, &orders, &result).unwrap();
+
+        assert_eq!(result.fills, [0, 0]);
+        assert_ne!(
+            transition.previous_root, transition.new_root,
+            "accepted orders consume nonces even when unfilled"
+        );
+    }
+
+    #[test]
+    fn account_state_transition_rejects_nonce_gaps_and_unsorted_accounts() {
+        let orders = [
+            signed_order(11, Side::Buy, 10, 2, 6, 9, 101),
+            signed_order(22, Side::Sell, 10, 2, 3, 9, 101),
+        ];
+        let result = clear_auction(&orders, None).unwrap();
+        let mut accounts = vec![
+            AccountState {
+                account_id: orders[0].account_id,
+                next_nonce: 5,
+                base_balance: 0,
+                quote_balance: 20,
+            },
+            AccountState {
+                account_id: orders[1].account_id,
+                next_nonce: 3,
+                base_balance: 2,
+                quote_balance: 0,
+            },
+        ];
+        accounts.sort_unstable_by_key(|account| account.account_id);
+
+        assert_eq!(
+            apply_account_state_transition(&accounts, &orders, &result),
+            Err(MatchError::NonceMismatch)
+        );
+        accounts.reverse();
+        assert_eq!(
+            account_state_root(&accounts),
+            Err(MatchError::InvalidAccountState)
         );
     }
 

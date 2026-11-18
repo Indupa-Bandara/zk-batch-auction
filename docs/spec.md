@@ -40,8 +40,41 @@ of the same message, excluding signature bytes, and is used to break allocation
 ties. An included batch is rejected if any order has an invalid signature or
 hash, mismatched batch identifier, zero quantity, or expired timestamp.
 
-Nonce freshness and uniqueness require account state and are not yet checked by
-the matcher; they are part of the later state-transition proof.
+Nonce freshness and uniqueness require account state and are checked by the
+state-transition proof below.
+
+## Account state and settlement
+
+The initial state witness contains every account, strictly sorted by account
+public key. Each account leaf contains the public key, next nonce, base balance,
+and quote balance. Every order account must already have a leaf; account
+creation is out of scope.
+
+The account-state Merkle tree uses SHA-256 with domain-separated encodings:
+
+- leaf: `batch-auction-exchange/account-leaf/v1` plus a zero byte, account
+  public key, next nonce as big-endian `u64`, and base and quote balances as
+  big-endian `u128`;
+- node: `batch-auction-exchange/account-node/v1` plus a zero byte, left child
+  hash, and right child hash;
+- an unpaired final node is paired with itself; the empty root is SHA-256 of
+  `batch-auction-exchange/account-empty/v1` followed by a zero byte.
+
+For each account, the nonces in its included orders must be exactly the
+consecutive range beginning at its current next nonce. The next nonce advances
+for every included order, including orders that receive no fill.
+
+Settlement is atomic and netted across the batch. At clearing price `p`, each
+buy fill of `f` lots credits `f` base units and debits `p * f` quote units; each
+sell fill debits `f` base units and credits `p * f` quote units. Incoming and
+outgoing amounts are netted per account before checking balances. All
+arithmetic is checked `u128`; an account cannot end with a negative balance.
+The proof publishes the old and new account roots, and settlement must apply
+the new root only if the old root is still current.
+
+For this first implementation, the prover supplies the complete account list
+and the guest recomputes both roots. This is a private but non-scalable witness;
+Merkle inclusion paths or multiproofs are a later optimization.
 
 ## Clearing price
 

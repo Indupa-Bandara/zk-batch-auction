@@ -1,8 +1,8 @@
 #![no_main]
 
 use batch_auction_matching::{
-    canonical_fills_bytes, canonical_order_batch_bytes, validate_signed_orders, verify_auction,
-    AuctionInput, AuctionPublicValues,
+    apply_account_state_transition, canonical_fills_bytes, canonical_order_batch_bytes,
+    validate_signed_orders, verify_auction, AuctionInput, AuctionPublicValues,
 };
 use risc0_zkvm::{
     guest::env,
@@ -23,6 +23,12 @@ fn main() {
         &input.expected_result,
     )
     .expect("host-provided auction result or order witness is invalid");
+    let state_transition = apply_account_state_transition(
+        &input.account_states,
+        &input.orders,
+        &input.expected_result,
+    )
+    .expect("account nonce, balance, or state witness is invalid");
 
     let public_values = AuctionPublicValues {
         batch_id: input.batch_id,
@@ -31,6 +37,8 @@ fn main() {
             &canonical_order_batch_bytes(&input.orders, &input.hash_sorted_order_indices)
                 .expect("order commitment must serialize"),
         ),
+        previous_account_root: state_transition.previous_root,
+        new_account_root: state_transition.new_root,
         previous_clearing_price: input.previous_clearing_price,
         clearing_price: input.expected_result.clearing_price,
         volume: input.expected_result.volume,
