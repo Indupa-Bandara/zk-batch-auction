@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7b222cfda95a813ab26cba2b47427281986ae0f03de364be748e5a5eccd8a84e # shrinks to raw_orders = [(false, 0, 4), (false, 3, 0), (true, 1, 5)], previous_clearing_price = None
