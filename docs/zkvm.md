@@ -29,16 +29,27 @@ work.
 
 The guest scans price levels to verify the clearing price and uses pairwise
 remainder ranking at the marginal allocation level, avoiding guest-side sorts.
-The guest build and proof have not been run because the Windows environment has
-no RISC Zero toolchain; validate them from the repository clone in the Ubuntu
-VM before relying on the proof.
+
+## Validation status
+
+The matching crate passed all 16 tests on Windows and Ubuntu 24.04. The
+dev-mode host/guest pipeline completed successfully on the Ubuntu VM with
+RISC Zero 3.1.0, reporting clearing price `101` and volume `15`. Dev mode is a
+development check, not a cryptographic proof.
+
+A real proof was attempted on the current VM (4 GiB RAM and 4 GiB swap), but
+the host process was killed with exit code 137 during proving. No real proof or
+receipt has been produced. The Windows host build also remains unsupported in
+this environment because of the RISC Zero/MSVC linker failure. Do not treat
+this prototype as production-ready.
 
 ## Linux toolchain
 
-Install the RISC Zero 3.1.0 components in the x86-64 Ubuntu VM using the
-[official installation guide](https://dev.risczero.com/api/zkvm/install). Pin
-the Rust toolchain, `r0vm`, and `cargo-risczero` versions as shown in that
-guide. Then, from the repository root, run:
+Install the RISC Zero components in the x86-64 Ubuntu VM using the
+[official installation guide](https://dev.risczero.com/api/zkvm/install). The
+validated setup used Rust toolchain 1.97.0, `r0vm` 3.1.0,
+`cargo-risczero` 3.1.0, and C++ toolchain 2024.1.5. From the repository root,
+run:
 
 ```sh
 cargo test -p batch-auction-matching
